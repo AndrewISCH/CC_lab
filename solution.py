@@ -1,196 +1,182 @@
+# coding: utf-8
 from Pyro4 import expose
 import random
-
-try:
-    from math import gcd
-except ImportError:
-    try:
-        from fractions import gcd
-    except ImportError:
-        def gcd(a, b):
-            while b:
-                a, b = b, a % b
-            return a
+import gc
 
 
 class Solver:
     def __init__(self, workers=None, input_file_name=None, output_file_name=None):
+        self.workers = workers
         self.input_file_name = input_file_name
         self.output_file_name = output_file_name
-        self.workers = workers
-        self.max_retries = 3
     
     def solve(self):
+        plaintext = None
+        ciphertext = None
         
-        n = self.read_input()
-        
-        if n < 2:
-            self.write_output([])
-            return
-        
-        if n == 2:
-            self.write_output([2])
-            return
-        
-        if n % 2 == 0:
-            factors = [2]
-            factors.extend(self.factorize_with_workers(n // 2))
-            self.write_output(sorted(list(set(factors))))
-            return
-        
-        if self.is_probably_prime(n):
-            self.write_output([n])
-            return
-        
-        factors = self.factorize_with_workers(n)
-        
-        if not factors:
-            self.write_output([])
-            return
-        
-        result = sorted(list(set(factors)))
-        self.write_output(result)
-    
-    def factorize_with_workers(self, n):
-        for attempt in range(1, self.max_retries + 1):
+        try:
+            size_mb = self.read_input()
+            plaintext = self.generate_data(size_mb)
+            key = self.generate_key(16)
             
-            factors = self.parallel_factorize(n, attempt)
+            plaintext_size = len(plaintext)
             
-            if factors:
-                return factors
-        
-        return []
+            ciphertext = self.parallel_encrypt_xor(plaintext, key)
+            
+            del plaintext
+            plaintext = None
+            gc.collect()
+            
+            self.write_output(key, ciphertext, plaintext_size)
+            
+            del ciphertext
+            ciphertext = None
+            gc.collect()
+            
+        except Exception as e:
+            if plaintext is not None:
+                del plaintext
+            if ciphertext is not None:
+                del ciphertext
+            gc.collect()
+            
+            f = open(self.output_file_name, 'w')
+            f.write("ERROR: %s\n" % str(e))
+            f.close()
+            raise
     
-    def parallel_factorize(self, n, attempt_number):
-        tasks = []
+    def generate_key(self, length=16):
+        characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+        key = ''.join([random.choice(characters) for _ in range(length)])
+        return key
+    
+    def generate_data(self, size_mb):
+        size_bytes = size_mb * 1024 * 1024
+        chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,!?\n'
+        
+        data = bytearray()
+        chunk_size = 1024 * 1024
+        remaining = size_bytes
+        
+        while remaining > 0:
+            current_chunk = min(chunk_size, remaining)
+            chunk = ''.join([random.choice(chars) for _ in range(current_chunk)])
+            data.extend(chunk.encode('utf-8'))
+            remaining -= current_chunk
+        
+        return bytes(data)
+    
+    def parallel_encrypt_xor(self, data, key):
+        if not isinstance(data, bytes):
+            data = str(data).encode('utf-8')
+        
+        data_size = len(data)
         num_workers = len(self.workers)
+        chunk_size = data_size // num_workers
         
-        base_iterations = 50000
-        max_iterations = base_iterations * attempt_number
-        
-        random.seed(attempt_number * 1000 + int(n % 1000000))
-        
+        tasks = []
         for i in range(num_workers):
-            x0 = random.randint(2, n - 1)
-            c = random.randint(1, n - 1)
-            tasks.append((n, x0, c, max_iterations))
-        
-        mapped = []
-        for i, worker in enumerate(self.workers):
-            mapped.append(worker.factorize_worker(tasks[i]))
-        
-        for i, result in enumerate(mapped):
-            factors = result.value
+            start = i * chunk_size
+            end = start + chunk_size if i < num_workers - 1 else data_size
             
-            if factors and len(factors) > 0:
-                return factors
+            task = {
+                'data': data[start:end],
+                'key': key,
+                'offset': start
+            }
+            tasks.append(task)
         
-        return []
+        results = []
+        futures = []
+        for i in range(num_workers):
+            future = self.workers[i].encrypt_data(tasks[i])
+            futures.append(future)
+
+        for future in futures:
+            results.append(future.value)
+
+        encrypted = b''.join(results)
+        
+        del tasks
+        gc.collect()
+        
+        return encrypted
     
     @staticmethod
     @expose
-    def factorize_worker(params):
-        n, x0, c, max_iterations = params
+    def encrypt_data(task):
+        data = task['data']
+        key = task['key']
+        offset = task['offset']
         
-        factor = Solver.pollard_rho_internal(n, x0, c, max_iterations)
-        
-        if not factor or factor == 1 or factor == n:
-            return []
-        
-        factors = []
-        factors.extend(Solver.factorize_complete(factor))
-        factors.extend(Solver.factorize_complete(n // factor))
-        
-        return factors
-    
-    @staticmethod
-    def pollard_rho_internal(n, x0, c, max_iterations):
-        x = x0
-        y = x0
-        d = 1
-        
-        iterations = 0
-        while d == 1 and iterations < max_iterations:
-            x = (x * x + c) % n
-            y = (y * y + c) % n
-            y = (y * y + c) % n
-            
-            d = gcd(abs(x - y), n)
-            iterations += 1
-        
-        if 1 < d < n:
-            return d
-        else:
-            return None
-    
-    @staticmethod
-    def factorize_complete(n):
-        if n <= 1:
-            return []
-        
-        if Solver.is_probably_prime(n):
-            return [n]
-        
-        small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
-        for prime in small_primes:
-            if n % prime == 0:
-                factors = [prime]
-                factors.extend(Solver.factorize_complete(n // prime))
-                return factors
-        
-        x0 = random.randint(2, n - 1)
-        c = random.randint(1, n - 1)
-        factor = Solver.pollard_rho_internal(n, x0, c, 50000)
-        
-        if factor and factor != 1 and factor != n:
-            factors = Solver.factorize_complete(factor)
-            factors.extend(Solver.factorize_complete(n // factor))
-            return factors
-        
-        return [n]
-    
-    @staticmethod
-    @expose
-    def is_probably_prime(n, k=5):
-        if n < 2:
-            return False
-        if n == 2 or n == 3:
-            return True
-        if n % 2 == 0:
-            return False
-        
-        r, d = 0, n - 1
-        while d % 2 == 0:
-            r += 1
-            d = d // 2
-        
-        for _ in range(k):
-            a = random.randint(2, n - 2)
-            x = pow(a, d, n)
-            
-            if x == 1 or x == n - 1:
-                continue
-            
-            for _ in range(r - 1):
-                x = pow(x, 2, n)
-                if x == n - 1:
-                    break
+        try:
+            if not isinstance(key, bytes):
+                key_bytes = bytearray(str(key).encode('utf-8'))
             else:
-                return False
-        
-        return True
+                key_bytes = bytearray(key)
+            
+            key_len = len(key_bytes)
+            encrypted = bytearray()
+            
+            for i in range(len(data)):
+                key_index = (offset + i) % key_len
+                
+                if isinstance(data[i], int):
+                    data_byte = data[i]
+                else:
+                    data_byte = ord(data[i])
+                
+                encrypted_byte = data_byte ^ key_bytes[key_index]
+                encrypted.append(encrypted_byte)
+            
+            result = bytes(encrypted)
+            
+            del data
+            del encrypted
+            gc.collect()
+            
+            return result
+            
+        except Exception:
+            gc.collect()
+            raise
     
     def read_input(self):
         f = open(self.input_file_name, 'r')
-        content = f.read().strip()
-        f.close()
-        return int(content)
+        try:
+            size_mb = int(f.read().strip())
+        finally:
+            f.close()
+        return size_mb
     
-    def write_output(self, factors):
-        f = open(self.output_file_name, 'w')
-        if factors and len(factors) > 0:
-            result = ' x '.join([str(x) for x in factors])
-            f.write('Factors: ' + result)
-        else:
-            f.write('Factors not found')
-        f.close()
+    def write_output(self, key, ciphertext, plaintext_size):
+        f = None
+        try:
+            f = open(self.output_file_name, 'w')
+            
+            f.write("Generated Encryption Key:\n")
+            f.write("%s\n\n" % key)
+            
+            f.write("Original data size: %d bytes (%.2f MB)\n" % 
+                    (plaintext_size, plaintext_size / (1024.0 * 1024.0)))
+            f.write("Encrypted data size: %d bytes (%.2f MB)\n\n" % 
+                    (len(ciphertext), len(ciphertext) / (1024.0 * 1024.0)))
+            
+            f.write("Encrypted data:\n")
+            
+            sample_size = min(1000, len(ciphertext))
+            
+            for i in range(sample_size):
+                byte_val = ciphertext[i]
+                if not isinstance(byte_val, int):
+                    byte_val = ord(byte_val)
+                
+                f.write('%02x' % byte_val)
+                
+                if (i + 1) % 32 == 0:
+                    f.write('\n')
+            
+            
+        finally:
+            if f is not None:
+                f.close()
