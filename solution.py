@@ -73,12 +73,14 @@ class Solver:
         data_size = len(data)
         num_workers = len(self.workers)
         chunk_size = data_size // num_workers
-        
+        mod = data_size % num_workers
         tasks = []
         for i in range(num_workers):
             start = i * chunk_size
             end = start + chunk_size if i < num_workers - 1 else data_size
-            
+            if(i < mod):
+                start = start + 1
+                end = end + 1
             task = {
                 'data': data[start:end],
                 'key': key,
